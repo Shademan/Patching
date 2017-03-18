@@ -5,10 +5,19 @@
  */
 package moa.tud.ke.patching;
 
+import com.github.javacliparser.FileOption;
 import com.github.javacliparser.FlagOption;
 import com.github.javacliparser.IntOption;
 import com.yahoo.labs.samoa.instances.Instance;
 import com.yahoo.labs.samoa.instances.SamoaToWekaInstanceConverter;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.Vector;
 import moa.classifiers.AbstractClassifier;
@@ -17,6 +26,8 @@ import weka.classifiers.Classifier;
 import weka.classifiers.rules.JRip;
 import weka.classifiers.rules.ZeroR;
 import weka.core.Instances;
+import weka.filters.Filter;
+import weka.filters.unsupervised.attribute.Add;
 
 /**
  *
@@ -41,12 +52,14 @@ public class AdaptivePatching extends AbstractClassifier {
     Instances origData;
     Instances errorInstances;
     Instances reDefinedClasses;
+    Instances prototypeData;
     InstanceStore instanceStore;
 
     Boolean initPhase = true;
     Vector subsets = new Vector();
     double basePerformance = 0;
     Vector basePerfOnSubset = new Vector();
+
 
     public AdaptivePatching() {
         super();
@@ -71,6 +84,8 @@ public class AdaptivePatching extends AbstractClassifier {
     public IntOption batchesToKeep = new IntOption("batchesToKeep", 'k',
             "The number of batches to keep in the Instance Store.", 5,
             0, Integer.MAX_VALUE);
+    
+    public FlagOption useBaseClassAsAttribute = new FlagOption("useBaseClassAsAttribute", 'a', "Use the result of the base classifier as additional attribute for the patches");
 
     public FlagOption forceNoAdaptation = new FlagOption("forceNoAdaptation", 'f', "If set, NO adaptation is processed!");
 
@@ -82,6 +97,8 @@ public class AdaptivePatching extends AbstractClassifier {
 
     public WEKAClassOption patchClassifierOption = new WEKAClassOption("patchLearner", 'p',
             "WEKA class to use for the patches as classifier.", weka.classifiers.Classifier.class, "weka.classifiers.rules.JRip");
+
+    public FileOption saveLoadModel = new FileOption("Modelfile", 'm', "Where to store/load the base model from/to", "", ".model", false);
 
     /**
      * Resets the learning process completely, as if nothing was ever learned.
@@ -129,13 +146,20 @@ public class AdaptivePatching extends AbstractClassifier {
         // React according to which phase we are in
         if (this.initPhase) {    // Initialisation phase
 
-            if (instancesInBatch > this.initialBatchSize.getValue()) {
+            if (instancesInBatch >= this.initialBatchSize.getValue()) {
                 this.initPhase = false;
 
                 this.origData = instancesBuffer;
                 instancesBuffer = null; // kill teh buffa
                 buildBaseClassifier();
                 instancesInBatch = 0; // reset this
+
+                if (useBaseClassAsAttribute.isSet()) {
+                    this.prototypeData = new Instances(this.origData);  // create an empty instance set, just for the attribute configuration
+                    while (prototypeData.size() > 0) {
+                        this.prototypeData.delete(0);
+                    }
+                }
             }
 
         } else { // Batch acquisition + update phase
@@ -156,12 +180,34 @@ public class AdaptivePatching extends AbstractClassifier {
     }
 
     /**
-     * Returns an instance of the trained base classifier.
+     * Returns an instance of the trained base classifier. Also saves/loads the
+     * classifier from/to a file if required.
      */
     private void buildBaseClassifier() {
+        System.out.println("Building base classifier after " + this.instancesInBatch + " instances.");
         try {
-            this.baseClassifier = getBaseClassifier();
-            this.baseClassifier.buildClassifier(origData);
+            Boolean baseExists = false;
+            if (this.saveLoadModel.getValue().length() > 1) {
+                System.out.print("Loading base classifier from " + this.saveLoadModel.getValue() + " ... ");
+                this.baseClassifier = FileModel.tryNLoadModel(this.saveLoadModel.getValue());
+                if (this.baseClassifier != null) {
+                    baseExists = true;
+                    System.out.println(" succeeded.");
+                } else {
+                    System.out.println(" failed (file does not exist)");
+                }
+            }
+
+            if (!baseExists) {
+                this.baseClassifier = getBaseClassifier();
+                this.baseClassifier.buildClassifier(origData);
+
+                if (this.saveLoadModel.getValue().length() > 1) {
+                    System.out.println("Saving base classifier to " + this.saveLoadModel.getValue());
+                    FileModel.saveModel(this.saveLoadModel.getValue(), this.baseClassifier);
+                }
+            }
+
         } catch (Exception e) {
             System.err.println("Error building base classifier:");
             System.err.println(e.getMessage());
@@ -240,7 +286,12 @@ public class AdaptivePatching extends AbstractClassifier {
         System.out.println("Update at Instance: " + this.numInstances + " | Size of Instance store (updates:" + this.updates + "): " + instanceStore.getInstances().size());
 
 // Turn the instances into a binary learning problem to learn the decision space where the original classifier was wrong
-        this.reDefinedClasses = redefineProblem();
+        
+        if(this.useBaseClassAsAttribute.isSet()) {
+            this.reDefinedClasses = redefineProblemWithBaseClass();
+        } else {
+            this.reDefinedClasses = redefineProblem();
+        }
 
         // Now: learn the error regions with a specially adapted or a normal classifier:
         try {
@@ -372,6 +423,11 @@ public class AdaptivePatching extends AbstractClassifier {
                     System.err.println(e.getMessage());
                 }
 
+                // Add the base classification as an Attribute:
+                if (useBaseClassAsAttribute.isSet()) {
+                    copy = addBaseClassToInstances(copy);
+                }
+
                 subsets.add(copy);
                 d++;
             }
@@ -414,39 +470,44 @@ public class AdaptivePatching extends AbstractClassifier {
 
         return 0;
     }
-
+    
     /**
-     * Creates a copy of the instances and removes all that have been correctly
-     * classified by the current model. Saves the error instances to
-     * this.errorInstances (accumulated over the various batches)
+     * Creates a copy (switchClass) of the instances and redefines the problem
+     * such that it is now important to classify the wrongly classified
+     * instances
      */
-    private void determineErrors(Instances data) {
+    private Instances redefineProblemWithBaseClass() {
 
-        Instances batchError = new Instances(data); // deep copy
-
-        int removed = 0;
-
-//        System.out.println("Before filtering: "+errorInstances.size());
+        Instances origInst = this.instanceStore.getInstances();
+        Instances redefInstances = addBaseClassToInstances(this.instanceStore.getInstances()); // deep copy of instance store with a new attribute.
+ 
         double predictedClass = 0;
 
-        Iterator inst = batchError.iterator();
+        Iterator inst = origInst.iterator();
+        int i=0;
         while (inst.hasNext()) {
             weka.core.Instance a = (weka.core.Instance) inst.next();
+            weka.core.Instance tmp = redefInstances.get(i);
+            i++;
+            
             try {
-                predictedClass = this.classifyInstance(a);
+                predictedClass = this.baseClassifier.classifyInstance(a); // Achtung: das hier muss "base" bleiben!!
             } catch (Exception e) {
-                System.err.println("Error while classifying instance in determineErrors.");
+                System.err.println("Error while classifying instance in redefineProblem");
                 System.err.println(e.getMessage());
+                System.err.println(e.fillInStackTrace());
+                System.exit(345646456);
             }
 
+            tmp.setValue(1, predictedClass);
             if (predictedClass == a.classValue()) {
-                inst.remove();  // remove from the errorInstances
-                removed++;
+                tmp.setClassValue(0);
+            } else {
+                tmp.setClassValue(1);
             }
         }
 
-        this.errorInstances = batchError;
-
+        return redefInstances;
     }
 
     /**
@@ -470,6 +531,8 @@ public class AdaptivePatching extends AbstractClassifier {
             } catch (Exception e) {
                 System.err.println("Error while classifying instance in redefineProblem");
                 System.err.println(e.getMessage());
+                System.err.println(e.fillInStackTrace());
+                System.exit(345646456);
             }
 
             if (predictedClass == a.classValue()) {
@@ -503,6 +566,16 @@ public class AdaptivePatching extends AbstractClassifier {
                 amountDeciders = this.regionDecider.getAmountOfDeciders();
 
                 Classifier patch;
+
+                // Handling of optional usage of the base class as an additional attribute.
+                if (useBaseClassAsAttribute.isSet()) {
+                    Instances tmp = new Instances(this.prototypeData); // deep copy of our empty prototypeData
+                    tmp.add(inst);
+                    tmp = addBaseClassToInstances(tmp);
+                    weka.core.Instance inst2 = tmp.get(0);
+                    inst = inst2;
+                    inst2 = null;
+                }
 
                 if (region != defaultDecider) {
                     if (amountDeciders > 1) {       // case a: there are actual region deciders
@@ -551,6 +624,7 @@ public class AdaptivePatching extends AbstractClassifier {
                 votes[klasse] = 1;
             } catch (Exception e) {
                 System.err.println("Classification failed... pfft.");
+                System.err.println(e.getMessage());
             }
         }
         return votes;
@@ -582,4 +656,144 @@ public class AdaptivePatching extends AbstractClassifier {
         return classy;
     }
 
+    /**
+     * Modify the instances and insert into them the class which the base
+     * classifier had them classified as.
+     *
+     * @return
+     */
+    private Instances addBaseClassToInstances(Instances origInstances) {
+
+        Instances moddedInstances = new Instances(origInstances); // deep copy
+
+        double predictedClass = 0;
+
+        // create new attribute
+        try {
+            moddedInstances = copyClassAttribute(moddedInstances, "oldClass", 1); // das was hier attribute 1 ist, wird zu index 0 
+            moddedInstances.setClassIndex(origInstances.classIndex()+1);
+        } catch (Exception e) {
+            System.err.println("Error while copying class Attribute for oldClass");
+        }
+
+        Iterator inst = origInstances.iterator();
+        int index = 0;
+        while (inst.hasNext()) {
+
+            weka.core.Instance a = (weka.core.Instance) inst.next();
+            weka.core.Instance target = moddedInstances.instance(index);
+
+            predictedClass = 0;
+            try {
+                predictedClass = this.baseClassifier.classifyInstance(a); // Achtung: das hier muss "base" bleiben!!
+            } catch (Exception e) {
+                System.err.println("Error while classifying instance in modifyInstances");
+                System.err.println(e.getMessage());
+            }
+
+            target.setValue(0, predictedClass); // index 0 ist attribute 1 
+            index++;
+        }
+        
+//        try {
+//            
+//            BufferedWriter writer = new BufferedWriter(new FileWriter("C:\\StAtIC\\experiments\\modded.arff"));
+//            writer.write(moddedInstances.toString());
+//            writer.flush();
+//            writer.close();
+//            
+//           writer = new BufferedWriter(new FileWriter("C:\\StAtIC\\experiments\\orig.arff"));
+//            writer.write(origInstances.toString());
+//            writer.flush();
+//            writer.close();
+//
+//           System.exit(45454);
+//        } catch (Exception e) {}
+
+        return moddedInstances;
+    }
+
+    /**
+     * Copies the class attribute to another position (first position)
+     *
+     * @param instances
+     * @param newName
+     * @param newAttributeIndex
+     * @return
+     * @throws Exception
+     */
+    public static Instances copyClassAttribute(Instances instances, String newName, int newAttributeIndex) throws Exception {
+
+        int whichAttribute = instances.classIndex();
+
+        Add filter = new Add();
+        filter.setAttributeIndex("" + newAttributeIndex);
+        filter.setAttributeName(newName);
+
+        // Copy nominal Attribute
+        if (instances.attribute(whichAttribute).isNominal()) {
+            String newNominalLabels = "";
+            Boolean first = true;
+            Enumeration<Object> o = instances.attribute(whichAttribute).enumerateValues();
+            while (o.hasMoreElements()) {
+                String s = (String) o.nextElement();
+                if (!first) {
+                    newNominalLabels += ",";
+                }
+                newNominalLabels += s;
+                first = false;
+            }
+            filter.setNominalLabels(newNominalLabels);
+        }
+
+        filter.setInputFormat(instances);
+        instances = Filter.useFilter(instances, filter);
+        return instances;
+    }
+
+    /**
+     * Private class for loading and saving a model to a file.
+     */
+    private static class FileModel {
+
+        static Classifier tryNLoadModel(String filename) {
+            Classifier cls = null;
+            try {
+                File f = new File(filename);
+                if (f.exists() && !f.isDirectory()) {
+                    // deserialize model
+                    ObjectInputStream ois = new ObjectInputStream(new FileInputStream(filename));
+                    cls = (Classifier) ois.readObject();
+                    ois.close();
+                }
+
+            } catch (Exception e) {
+                System.err.println("Error while loading base model from file: " + filename);
+            }
+            return cls;
+        }
+
+        static void saveModel(String filename, Classifier cls) {
+
+            // Try saving the base model
+            try {
+
+//                System.out.println(filename);
+//                
+//                filename = filename.replace("\\", "\\\\");
+                System.out.println(filename);
+                //filename = "C:\\StAtIC\\experiments\\mnist\\paramopti\\rf_base.model";
+
+                // serialize model
+                ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filename));
+                oos.writeObject(cls);
+                oos.flush();
+                oos.close();
+            } catch (Exception e) {
+                System.err.println("Error while saving base model to file: " + filename);
+            }
+
+        }
+
+    }
 }
