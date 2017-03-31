@@ -33,7 +33,7 @@ public class InstanceStore {
 
         batches.add(inst);
         
-        while (batches.size() >= this.numBatches) {
+        while (batches.size() > this.numBatches) {
             batches.removeFirst(); // FIFO
         }
     }

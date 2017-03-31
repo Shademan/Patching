@@ -24,10 +24,10 @@ import moa.classifiers.AbstractClassifier;
 import moa.options.WEKAClassOption;
 import weka.classifiers.Classifier;
 import weka.classifiers.rules.JRip;
-import weka.classifiers.rules.ZeroR;
 import weka.core.Instances;
 import weka.filters.Filter;
 import weka.filters.unsupervised.attribute.Add;
+import weka.filters.unsupervised.attribute.Remove;
 
 /**
  *
@@ -60,7 +60,6 @@ public class AdaptivePatching extends AbstractClassifier {
     double basePerformance = 0;
     Vector basePerfOnSubset = new Vector();
 
-
     public AdaptivePatching() {
         super();
     }
@@ -84,7 +83,7 @@ public class AdaptivePatching extends AbstractClassifier {
     public IntOption batchesToKeep = new IntOption("batchesToKeep", 'k',
             "The number of batches to keep in the Instance Store.", 5,
             0, Integer.MAX_VALUE);
-    
+
     public FlagOption useBaseClassAsAttribute = new FlagOption("useBaseClassAsAttribute", 'a', "Use the result of the base classifier as additional attribute for the patches");
 
     public FlagOption forceNoAdaptation = new FlagOption("forceNoAdaptation", 'f', "If set, NO adaptation is processed!");
@@ -240,13 +239,13 @@ public class AdaptivePatching extends AbstractClassifier {
      */
     private Classifier getPatchClassifier() {
         try {
-            String[] options = weka.core.Utils.splitOptions(baseClassifierOption.getValueAsCLIString());
+            String[] options = weka.core.Utils.splitOptions(patchClassifierOption.getValueAsCLIString());
             Classifier tmp = createWekaClassifier(options);
 
             return tmp;
         } catch (Exception e) {
             System.err.println("Error retrieving selected classifier:");
-            System.err.println("Chosen classifier: " + this.baseClassifierOption.getValueAsCLIString());
+            System.err.println("Chosen classifier: " + this.patchClassifierOption.getValueAsCLIString());
             System.err.println(e.getMessage());
         }
         return null;
@@ -278,25 +277,29 @@ public class AdaptivePatching extends AbstractClassifier {
 
     public void updateClassifier(Instances data) {
 
+        System.out.println("########## UPDATE PHASE ############");
         this.updates++;
 
         // First: merge the new instances to the "Instance Store"
-        this.instanceStore.addInstances(data);
-
-        System.out.println("Update at Instance: " + this.numInstances + " | Size of Instance store (updates:" + this.updates + "): " + instanceStore.getInstances().size());
-
-// Turn the instances into a binary learning problem to learn the decision space where the original classifier was wrong
+        this.instanceStore.addInstances(data);        
+        Instances currentStore = this.instanceStore.getInstances();
         
-        if(this.useBaseClassAsAttribute.isSet()) {
-            this.reDefinedClasses = redefineProblemWithBaseClass();
-        } else {
-            this.reDefinedClasses = redefineProblem();
-        }
+
+        System.out.println("Update at Instance: " + this.numInstances + " | Size of Instance store (updates:" + this.updates + "): " + currentStore.size());
+        
+        // Turn the instances into a binary learning problem to learn the decision space where the original classifier was wrong
+        writeArff("C:\\StAtIC\\experiments\\orig.arff", currentStore);
+        this.reDefinedClasses = redefineProblem(currentStore);
+        writeArff("C:\\StAtIC\\experiments\\modded.arff", this.reDefinedClasses);
+//        System.exit(9525356);
+                
 
         // Now: learn the error regions with a specially adapted or a normal classifier:
         try {
             this.regionDecider = new DSALearnerWrapper(getDecisionSpaceClassifier());
             regionDecider.buildClassifier(reDefinedClasses);
+
+//            System.out.println("Error Space Classifier:"); System.out.println(regionDecider.toString());       // Todo remove this out
         } catch (Exception e) {
             System.err.println("Error building region decider");
             System.err.println(e.getStackTrace());
@@ -305,7 +308,12 @@ public class AdaptivePatching extends AbstractClassifier {
         }
 
         // Determine the subsets of instances which are covered by the rules (that are not the default rule)
-        this.subsets = determineSubsets(data, regionDecider);
+        
+        if(this.useBaseClassAsAttribute.isSet())
+        {
+            currentStore = addBaseClassToInstances(currentStore);
+        }        
+        this.subsets = determineSubsets(currentStore, regionDecider);
         System.out.println("Region Decision Subsets: " + subsets.size());
 
         // Determine the performance of the BASE classifier for each of those subsets
@@ -313,6 +321,8 @@ public class AdaptivePatching extends AbstractClassifier {
         // Create individual models for the subsets
         this.regionPatches = createPatches(this.subsets, this.basePerfOnSubset);
 
+//        System.exit(18567820);
+        System.out.println("##############################\n\n\n");
     }
 
     /**
@@ -343,26 +353,43 @@ public class AdaptivePatching extends AbstractClassifier {
     private Vector createPatches(Vector subsets, Vector basePerformance) {
         Vector patches = new Vector();
 
-        //System.out.println("Creating patches: #"+subsets.size());
+        System.out.println("Creating patches: #" + subsets.size());
         try {
             for (int d = 0; d < subsets.size(); d++) {
 
                 Instances set = (Instances) subsets.get(d);
-
+                
+//                if(this.useBaseClassAsAttribute.isSet()) {
+//                        writeArff("C:\\StAtIC\\experiments\\set"+d+".arff", set);
+//                    }
+//                System.out.println("Set " + d + " size: " + set.size());
                 Classifier patch;
                 if (set.size() < 5) // Too small to do anything properly
                 {
-                    patch = new ZeroR();
+                    patch = null;   // null will then default to base classifier
                 } else {
+                    
                     patch = getPatchClassifier();
+                    patch.buildClassifier(set);
                 }
-                patch.buildClassifier(set);
+
                 patches.add(d, patch);
             }
         } catch (Exception e) {
             System.err.println("Error building patches:");
             System.err.println(e.getMessage());
         }
+
+//        System.out.println("\n--- Patches ------------");
+//        for (int i = 0; i < patches.size(); i++) {
+//            Classifier tmp = (Classifier) patches.get(i);
+//            if (tmp != null) {
+//                System.out.print("Patch " + i+" - ");
+//                System.out.println(tmp);
+//            }
+//        }
+//        System.out.println("------------------------");
+//        System.exit(45768545);
         return patches;
     }
 
@@ -387,7 +414,7 @@ public class AdaptivePatching extends AbstractClassifier {
 
     private Vector determineSubsets(Instances data, Classifier detector) {
         Vector subsets = new Vector();
-
+     
         if (detector instanceof DeciderEnumerator) {
 
             DeciderEnumerator decider = (DeciderEnumerator) detector;
@@ -395,12 +422,16 @@ public class AdaptivePatching extends AbstractClassifier {
             int numDeciders = decider.getAmountOfDeciders();
             int lastDecider = 0;
 
+            Boolean isMultiDecider = true;
+
             int d = 0;
             if (numDeciders == 1) {  // ACHTUNG: wenn nur ein Decider da ist (also keine Subunterteilung der decision spaces vorliegt)
                 d = 1;              // dann wird hier die parametrisierung für die folgende schleife angepasst.
                 numDeciders++;
+                isMultiDecider = false;
             }
 
+            //System.out.println("Total instances: "+data.size());
             // In order to save some ram we are going to do this iteratively
             while (d < numDeciders) {
                 Instances copy = new Instances(data); // Make a clone of the full dataset
@@ -412,10 +443,20 @@ public class AdaptivePatching extends AbstractClassifier {
                     while (i.hasNext()) {
                         weka.core.Instance inst = (weka.core.Instance) i.next();
 
-                        detector.classifyInstance(inst);
-                        lastDecider = decider.getLastUsedDecider();
-                        if (lastDecider != d) {
-                            i.remove();
+                        double cls = detector.classifyInstance(inst);
+                        if (isMultiDecider) {
+                            lastDecider = decider.getLastUsedDecider();
+                            if (lastDecider != d) {
+                                i.remove();
+                            } else {
+                                if (cls == 1) {
+                                    i.remove();  // if the initial classification is correct, we wont bother!!
+                                }
+                            }
+                        } else {
+                            if (cls == 1) {
+                                i.remove();  // if the initial classification is correct, we wont bother!!
+                            }
                         }
                     }
                 } catch (Exception e) {
@@ -423,20 +464,14 @@ public class AdaptivePatching extends AbstractClassifier {
                     System.err.println(e.getMessage());
                 }
 
-                // Add the base classification as an Attribute:
-                if (useBaseClassAsAttribute.isSet()) {
-                    copy = addBaseClassToInstances(copy);
-                }
-
                 subsets.add(copy);
                 d++;
             }
 
-            int defaultDecider = decider.getDefaultDecider();
-            if (decider.getAmountOfDeciders() > 1 && defaultDecider >= 0) {
-                subsets.remove(defaultDecider);
-            }
-
+//            int defaultDecider = decider.getDefaultDecider();
+//            if (decider.getAmountOfDeciders() > 1 && defaultDecider >= 0) {
+//                subsets.remove(defaultDecider);
+//            }
         }
 
         return subsets;
@@ -470,76 +505,47 @@ public class AdaptivePatching extends AbstractClassifier {
 
         return 0;
     }
-    
-    /**
-     * Creates a copy (switchClass) of the instances and redefines the problem
-     * such that it is now important to classify the wrongly classified
-     * instances
-     */
-    private Instances redefineProblemWithBaseClass() {
-
-        Instances origInst = this.instanceStore.getInstances();
-        Instances redefInstances = addBaseClassToInstances(this.instanceStore.getInstances()); // deep copy of instance store with a new attribute.
- 
-        double predictedClass = 0;
-
-        Iterator inst = origInst.iterator();
-        int i=0;
-        while (inst.hasNext()) {
-            weka.core.Instance a = (weka.core.Instance) inst.next();
-            weka.core.Instance tmp = redefInstances.get(i);
-            i++;
-            
-            try {
-                predictedClass = this.baseClassifier.classifyInstance(a); // Achtung: das hier muss "base" bleiben!!
-            } catch (Exception e) {
-                System.err.println("Error while classifying instance in redefineProblem");
-                System.err.println(e.getMessage());
-                System.err.println(e.fillInStackTrace());
-                System.exit(345646456);
-            }
-
-            tmp.setValue(1, predictedClass);
-            if (predictedClass == a.classValue()) {
-                tmp.setClassValue(0);
-            } else {
-                tmp.setClassValue(1);
-            }
-        }
-
-        return redefInstances;
-    }
 
     /**
-     * Creates a copy (switchClass) of the instances and redefines the problem
-     * such that it is now important to classify the wrongly classified
-     * instances
+     * Creates a copy of the instances and redefines the problem such that it is
+     * now important to classify the wrongly classified instances
      */
-    private Instances redefineProblem() {
+    private Instances redefineProblem(Instances data) {
 
-        Instances redefInstances = new Instances(this.instanceStore.getInstances()); // deep copy of instance store
+        Instances redefInstances = new Instances(data); // deep copy of instance store
 
 //        System.out.println(reDefinedClasses.attributeStats(reDefinedClasses.classIndex()));
 //        System.out.println("Before filtering: "+wrongData.size());
         double predictedClass = 0;
 
-        Iterator inst = redefInstances.iterator();
-        while (inst.hasNext()) {
-            weka.core.Instance a = (weka.core.Instance) inst.next();
-            try {
+        int oldClassIndex = redefInstances.classIndex();
+
+        try {
+
+            Iterator inst = redefInstances.iterator();
+            while (inst.hasNext()) {
+                weka.core.Instance a = (weka.core.Instance) inst.next();
+
                 predictedClass = this.baseClassifier.classifyInstance(a); // Achtung: das hier muss "base" bleiben!!
-            } catch (Exception e) {
-                System.err.println("Error while classifying instance in redefineProblem");
-                System.err.println(e.getMessage());
-                System.err.println(e.fillInStackTrace());
-                System.exit(345646456);
+
+                if (predictedClass == a.classValue()) {
+                    a.setClassValue(1);
+                } else {
+                    a.setClassValue(0);
+                }
             }
 
-            if (predictedClass == a.classValue()) {
-                a.setClassValue(0);
-            } else {
-                a.setClassValue(1);
+            if(this.useBaseClassAsAttribute.isSet()) {
+                redefInstances = addBaseClassToInstances(redefInstances);
             }
+            
+            redefInstances = changeClassToWrongRight(redefInstances);
+
+        } catch (Exception e) {
+            System.err.println("Error while classifying instance in redefineProblem");
+            System.err.println(e.getMessage());
+            System.err.println(e.fillInStackTrace());
+            System.exit(987654);
         }
 
         return redefInstances;
@@ -555,20 +561,14 @@ public class AdaptivePatching extends AbstractClassifier {
         int defaultDecider = -1;
         int amountDeciders = -1;
         double label;
+        
+        weka.core.Instance origInst = inst;
 
         try {
             if (this.regionDecider != null) {
-                // Pre-classify instance and retrieve the used Decider
-                double regClass = this.regionDecider.classifyInstance(inst);
-
-                region = this.regionDecider.getLastUsedDecider();
-                defaultDecider = this.regionDecider.getDefaultDecider();
-                amountDeciders = this.regionDecider.getAmountOfDeciders();
-
-                Classifier patch;
 
                 // Handling of optional usage of the base class as an additional attribute.
-                if (useBaseClassAsAttribute.isSet()) {
+                if (this.useBaseClassAsAttribute.isSet()) {
                     Instances tmp = new Instances(this.prototypeData); // deep copy of our empty prototypeData
                     tmp.add(inst);
                     tmp = addBaseClassToInstances(tmp);
@@ -577,16 +577,37 @@ public class AdaptivePatching extends AbstractClassifier {
                     inst2 = null;
                 }
 
-                if (region != defaultDecider) {
-                    if (amountDeciders > 1) {       // case a: there are actual region deciders
+                // Pre-classify instance and retrieve the used Decider
+                double regClass = this.regionDecider.classifyInstance(inst);
+
+                if (regClass == 0) {    // only if its in a "wrong" region
+
+                    Boolean isMultiDecider = false;
+                    if (this.regionDecider.getAmountOfDeciders() > 1) {
+                        isMultiDecider = true;
+                    }
+
+                    Classifier patch;
+
+                    if (isMultiDecider) {
+                        region = this.regionDecider.getLastUsedDecider();
+                        
+//                        System.out.println("using patch region decider: "+region);
+                        
                         patch = (Classifier) regionPatches.elementAt(region);
-                        //System.out.println("using patch region decider: "+region);
-                        label = patch.classifyInstance(inst);
-                        return label;
+                        if (patch != null) {
+                            return patch.classifyInstance(inst);
+                        }
                     } else {                        // case b: we only have a 0/1 information about if its in the error region or not.
                         patch = (Classifier) regionPatches.elementAt(0);
-                        label = patch.classifyInstance(inst);
-                        return label;
+                        if (patch != null) {
+                            return patch.classifyInstance(inst);
+                        }
+
+                    }
+                } else { // if its not in a "wrong" region, return the class from the base classifier
+                    if (this.useBaseClassAsAttribute.isSet()) {
+                        return inst.value(0);   // this has maybe already been calculated into the first attribute.
                     }
                 }
             }
@@ -597,7 +618,7 @@ public class AdaptivePatching extends AbstractClassifier {
             System.exit(234545345);
         }
 
-        return baseClassifier.classifyInstance(inst);
+        return baseClassifier.classifyInstance(origInst);
     }
 
     /**
@@ -663,17 +684,18 @@ public class AdaptivePatching extends AbstractClassifier {
      * @return
      */
     private Instances addBaseClassToInstances(Instances origInstances) {
-
+        
         Instances moddedInstances = new Instances(origInstances); // deep copy
 
         double predictedClass = 0;
 
         // create new attribute
         try {
-            moddedInstances = copyClassAttribute(moddedInstances, "oldClass", 1); // das was hier attribute 1 ist, wird zu index 0 
-            moddedInstances.setClassIndex(origInstances.classIndex()+1);
+            moddedInstances = copyClassAttribute(moddedInstances, "baseLabel", 1); // das was hier attribute 1 ist, wird zu index 0 
+            moddedInstances.setClassIndex(origInstances.classIndex() + 1);
         } catch (Exception e) {
-            System.err.println("Error while copying class Attribute for oldClass");
+            System.err.println("Error while copying class Attribute for baseLabel");
+            System.err.println(e.getMessage());
         }
 
         Iterator inst = origInstances.iterator();
@@ -687,28 +709,14 @@ public class AdaptivePatching extends AbstractClassifier {
             try {
                 predictedClass = this.baseClassifier.classifyInstance(a); // Achtung: das hier muss "base" bleiben!!
             } catch (Exception e) {
-                System.err.println("Error while classifying instance in modifyInstances");
+                System.err.println("Error while classifying instance in addBaseClassToInstances");
+                System.err.println(a);
                 System.err.println(e.getMessage());
             }
 
             target.setValue(0, predictedClass); // index 0 ist attribute 1 
             index++;
         }
-        
-//        try {
-//            
-//            BufferedWriter writer = new BufferedWriter(new FileWriter("C:\\StAtIC\\experiments\\modded.arff"));
-//            writer.write(moddedInstances.toString());
-//            writer.flush();
-//            writer.close();
-//            
-//           writer = new BufferedWriter(new FileWriter("C:\\StAtIC\\experiments\\orig.arff"));
-//            writer.write(origInstances.toString());
-//            writer.flush();
-//            writer.close();
-//
-//           System.exit(45454);
-//        } catch (Exception e) {}
 
         return moddedInstances;
     }
@@ -749,6 +757,53 @@ public class AdaptivePatching extends AbstractClassifier {
         filter.setInputFormat(instances);
         instances = Filter.useFilter(instances, filter);
         return instances;
+    }
+
+    public static Instances changeClassToWrongRight(Instances instances) throws Exception {
+
+        int whichAttribute = instances.classIndex();
+
+//        System.out.println(instances.classAttribute().toString());
+        Add filter = new Add();
+        //filter.setAttributeIndex("" + (whichAttribute + 1));
+        filter.setAttributeName("newClass");
+
+        String newNominalLabels = "wrong,right";
+        filter.setNominalLabels(newNominalLabels);
+
+        filter.setInputFormat(instances);
+        instances = Filter.useFilter(instances, filter);
+
+        Iterator inst = instances.iterator();
+        int index = 0;
+        while (inst.hasNext()) {
+            weka.core.Instance a = (weka.core.Instance) inst.next();
+            a.setValue((whichAttribute + 1), a.classValue());
+            index++;
+        }
+
+        Remove rmfilter = new Remove();
+        rmfilter.setAttributeIndices("" + (instances.classIndex() + 1));
+        rmfilter.setInputFormat(instances);
+        instances = Filter.useFilter(instances, rmfilter);
+
+        instances.setClassIndex(instances.numAttributes() - 1);
+
+//        System.out.println(instances.classAttribute().toString());
+        return instances;
+    }
+
+    static void writeArff(String filename, Instances data) {
+        try {
+
+            BufferedWriter writer = new BufferedWriter(new FileWriter(filename));
+            writer.write(data.toString());
+            writer.flush();
+            writer.close();
+
+        } catch (Exception e) {
+            System.err.println("Error writing arff file.");
+        }
     }
 
     /**
