@@ -1,0 +1,1 @@
+In order to run, put the whole content including /tud/... into the moa/ directory of your MOA installation.
