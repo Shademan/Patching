@@ -89,6 +89,8 @@ public class InstanceStore {
             Iterator it = inst.iterator();
             while (it.hasNext()) {
                 Instance in = (Instance) it.next();
+                
+                in.setWeight(i);
                 merged.add(in);
             }
         }
