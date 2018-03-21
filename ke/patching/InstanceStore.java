@@ -7,6 +7,8 @@ package moa.tud.ke.patching;
 
 import java.util.Iterator;
 import java.util.LinkedList;
+
+import moa.classifiers.core.driftdetection.ADWIN;
 import weka.core.Instance;
 import weka.core.Instances;
 
@@ -36,6 +38,7 @@ public class InstanceStore {
         while (batches.size() > this.numBatches) {
             batches.removeFirst(); // FIFO
         }
+
     }
 
     /**
@@ -54,6 +57,15 @@ public class InstanceStore {
         return null;
     }
 
+    public void cleanBatch(int index, int size){
+        Instances inst = getBatch(index);
+        System.out.println("Size Batch: " + inst.size());
+        while (inst.size() > size) {
+            inst.delete(0);
+        }
+        System.out.println("Size Batch: " + inst.size());
+    }
+
     /**
      * Merges all the batches of instances and returns them.
      *
@@ -66,9 +78,6 @@ public class InstanceStore {
     /**
      * Merges all the batches of instances.
      * Probably theres a way to speed this up?
-     *
-     * @param a
-     * @param b
      * @return
      */
     private Instances mergeAllInstances() {
@@ -89,11 +98,13 @@ public class InstanceStore {
             Iterator it = inst.iterator();
             while (it.hasNext()) {
                 Instance in = (Instance) it.next();
-                
-                in.setWeight(i);
                 merged.add(in);
             }
         }
         return merged;
+    }
+
+    public void setNumBatches(int numBatches){
+        this.numBatches = numBatches;
     }
 }
